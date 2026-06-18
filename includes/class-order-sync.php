@@ -1,5 +1,5 @@
 <?php
-namespace DSNCarfac;
+namespace DSNWooPowerall;
 
 class Order_Sync {
     /**
@@ -27,56 +27,61 @@ class Order_Sync {
     public function handle_new_order($order_id) {
         $order = wc_get_order($order_id);
         if (!$order) {
-            return new \WP_Error('invalid_order', __('Invalid order.', 'dsn-carfac'));
+            return new \WP_Error('invalid_order', __('Invalid order.', 'dsn-woo-powerall'));
         }
 
-    // Prepare order data for Carfac
-    $order_data = $this->prepare_order_data($order);
+        if ($order->get_meta('_powerall_order_id')) {
+            return true;
+        }
 
-    // Create order via API handler (delegates to Carfac provider)
-    $result = $this->api_handler->create_order($order_data);
-        
-        if (is_wp_error($result)) {
-            // Log error
+        $order_data = $this->prepare_order_data($order);
+        if (is_wp_error($order_data)) {
             $order->add_order_note(
                 sprintf(
-                    __('Failed to create order in Carfac: %s', 'dsn-carfac'),
+                    __('Failed to create order in Powerall CRM: %s', 'dsn-woo-powerall'),
+                    $order_data->get_error_message()
+                )
+            );
+            return $order_data;
+        }
+
+        $result = $this->api_handler->create_order($order_data);
+
+        if (is_wp_error($result)) {
+            $order->add_order_note(
+                sprintf(
+                    __('Failed to create order in Powerall CRM: %s', 'dsn-woo-powerall'),
                     $result->get_error_message()
                 )
             );
             return $result;
         }
 
-        // Save Carfac-specific IDs
-        $provider_ids = [];
-        if ($existing = $order->get_meta('_sc_provider_ids')) {
-            $existing_map = json_decode($existing, true);
-            if (is_array($existing_map)) {
-                $provider_ids = $existing_map;
-            }
+        $powerall_order = isset($result['Data'][0]) && is_array($result['Data'][0])
+            ? $result['Data'][0]
+            : (isset($result['Data']) && is_array($result['Data']) ? $result['Data'] : $result);
+        $powerall_order_id = isset($powerall_order['Id']) ? (string) $powerall_order['Id'] : '';
+
+        if ($powerall_order_id === '') {
+            $error = new \WP_Error('invalid_order_response', __('Powerall did not return an order ID.', 'dsn-woo-powerall'));
+            $order->add_order_note(
+                sprintf(
+                    __('Failed to create order in Powerall CRM: %s', 'dsn-woo-powerall'),
+                    $error->get_error_message()
+                )
+            );
+            return $error;
         }
 
-        if (isset($result['WorkorderId'])) {
-            $order->update_meta_data('_carfac_workorder_id', $result['WorkorderId']);
-            $provider_ids['carfac'] = $result['WorkorderId'];
-        }
-        if (isset($result['CustomerId'])) {
-            $order->update_meta_data('_carfac_customer_id', $result['CustomerId']);
-            $provider_ids['carfac_customer'] = $result['CustomerId'];
-        }
-
-        // Store unified provider id map as JSON
-        if (!empty($provider_ids)) {
-            $order->update_meta_data('_sc_provider_ids', wp_json_encode($provider_ids));
-        }
+        $order->update_meta_data('_powerall_order_id', $powerall_order_id);
         $order->save();
 
-        // Add success note(s)
-        if (!empty($provider_ids)) {
-            foreach ($provider_ids as $k => $v) {
-                $order->add_order_note(sprintf(__('Order created in Carfac [%s] with ID: %s', 'dsn-carfac'), esc_html($k), esc_html($v)));
-            }
-        }
+        $order->add_order_note(
+            sprintf(
+                __('Order created in Powerall CRM with ID: %s', 'dsn-woo-powerall'),
+                $powerall_order_id
+            )
+        );
 
         return true;
     }
@@ -92,25 +97,25 @@ class Order_Sync {
     public function handle_order_status_change($order_id, $old_status, $new_status) {
         $order = wc_get_order($order_id);
         if (!$order) {
-            return new \WP_Error('invalid_order', __('Invalid order.', 'dsn-carfac'));
+            return new \WP_Error('invalid_order', __('Invalid order.', 'dsn-woo-powerall'));
         }
 
-        $carfac_order_id = $order->get_meta('_carfac_workorder_id');
-        if (!$carfac_order_id) {
-            return new \WP_Error('no_carfac_id', __('Order not synced with Carfac.', 'dsn-carfac'));
+        $powerall_order_id = $order->get_meta('_powerall_order_id');
+        if (!$powerall_order_id) {
+            return new \WP_Error('no_powerall_id', __('Order not synced with Powerall CRM.', 'dsn-woo-powerall'));
         }
 
-        // Map WooCommerce status to Carfac status
-        $carfac_status = $this->map_order_status($new_status);
+        // Map WooCommerce status to Powerall CRM status
+        $powerall_status = $this->map_order_status($new_status);
 
-        // Update order status in Carfac
-        $result = $this->api_handler->update_order_status($carfac_order_id, $carfac_status);
+        // Update order status in Powerall CRM
+        $result = $this->api_handler->update_order_status($powerall_order_id, $powerall_status);
 
         if (is_wp_error($result)) {
             // Log error
             $order->add_order_note(
                 sprintf(
-                    __('Failed to update order status in Carfac: %s', 'dsn-carfac'),
+                    __('Failed to update order status in Powerall CRM: %s', 'dsn-woo-powerall'),
                     $result->get_error_message()
                 )
             );
@@ -120,8 +125,8 @@ class Order_Sync {
         // Add success note
         $order->add_order_note(
             sprintf(
-                __('Order status updated in Carfac to: %s', 'dsn-carfac'),
-                $carfac_status
+                __('Order status updated in Powerall CRM to: %s', 'dsn-woo-powerall'),
+                $powerall_status
             )
         );
 
@@ -129,36 +134,40 @@ class Order_Sync {
     }
 
     /**
-     * Prepare order data for Carfac
+     * Prepare order data for Powerall CRM
      *
      * @param WC_Order $order WooCommerce order
-     * @return array Order data for Carfac
+     * @return array|\WP_Error Order data for Powerall CRM
      */
     private function prepare_order_data($order) {
         $items = array();
         foreach ($order->get_items() as $item) {
             $product = $item->get_product();
-            // Prefer Carfac-specific product id meta, fall back to SKU
-            $carfac_product_id = null;
-            if ($product) {
-                $carfac_product_id = $product->get_meta('_carfac_product_id');
-                if (empty($carfac_product_id)) {
-                    $carfac_product_id = $product->get_sku();
-                }
-            }
+            $product_code = $product ? $this->get_powerall_product_code($product) : '';
 
-            if ($carfac_product_id) {
-                $quantity = $item->get_quantity();
-                $line_total = (float) $item->get_total();
-                $unit_price = $quantity > 0 ? ($line_total / $quantity) : $line_total;
-                $items[] = array(
-                    'product_id' => $carfac_product_id,
-                    'quantity' => $quantity,
-                    'unit_price' => $unit_price,
-                    'price' => $line_total,
-                    'name' => $item->get_name(),
+            if ($product_code === '') {
+                return new \WP_Error(
+                    'missing_powerall_product_code',
+                    sprintf(
+                        /* translators: %s: order item name */
+                        __('No Powerall ProductCode was found for order item "%s".', 'dsn-woo-powerall'),
+                        $item->get_name()
+                    )
                 );
             }
+
+            $quantity = (float) $item->get_quantity();
+            $line_total = (float) $item->get_total();
+            $line_tax = (float) $item->get_total_tax();
+            $items[] = array(
+                'sku' => $product_code,
+                'quantity' => $quantity,
+                'gross_price' => $quantity > 0 ? ($line_total + $line_tax) / $quantity : 0,
+            );
+        }
+
+        if (empty($items)) {
+            return new \WP_Error('missing_order_lines', __('The order does not contain any product lines for Powerall.', 'dsn-woo-powerall'));
         }
 
         // Get billing address using HPOS-compatible methods
@@ -193,8 +202,11 @@ class Order_Sync {
 
         return array(
             'external_id' => $order->get_id(),
+            'order_number' => $order->get_order_number(),
+            'customer_id' => $order->get_customer_id(), // WP user ID (0 for guests)
             'customer' => $billing_address,
-            'shipping' => $shipping_address,
+            'billing_address' => $billing_address,
+            'shipping_address' => $shipping_address,
             'items' => $items,
             'total' => $order->get_total(),
             'currency' => $order->get_currency(),
@@ -208,10 +220,29 @@ class Order_Sync {
     }
 
     /**
-     * Map WooCommerce order status to Carfac status
+     * Resolve the Powerall product code stored during sync, falling back to SKU.
+     *
+     * @param WC_Product $product WooCommerce product
+     * @return string
+     */
+    private function get_powerall_product_code($product) {
+        $snapshot = $product->get_meta('_dsn_powerall_last_sync_snapshot');
+        if (is_string($snapshot)) {
+            $snapshot = json_decode($snapshot, true);
+        }
+
+        if (is_array($snapshot) && !empty($snapshot['product_code'])) {
+            return trim((string) $snapshot['product_code']);
+        }
+
+        return trim((string) $product->get_sku());
+    }
+
+    /**
+     * Map WooCommerce order status to Powerall CRM status
      *
      * @param string $wc_status WooCommerce order status
-     * @return string Carfac order status
+     * @return string Powerall CRM order status
      */
     private function map_order_status($wc_status) {
         $status_map = array(
@@ -227,4 +258,3 @@ class Order_Sync {
         return isset($status_map[$wc_status]) ? $status_map[$wc_status] : 'pending';
     }
 }
- 

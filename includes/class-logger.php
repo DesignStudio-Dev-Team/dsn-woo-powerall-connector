@@ -1,5 +1,5 @@
 <?php
-namespace DSNCarfac;
+namespace DSNWooPowerall;
 
 class Logger {
     /**
@@ -14,7 +14,7 @@ class Logger {
      */
     public function __construct() {
         $upload_dir = wp_upload_dir();
-        $this->log_file = $upload_dir['basedir'] . '/dsn-carfac.log';
+        $this->log_file = $upload_dir['basedir'] . '/dsn-woo-powerall.log';
     }
 
     /**
@@ -87,5 +87,4 @@ class Logger {
     public function clear_log() {
         return file_put_contents($this->log_file, '');
     }
-}
- 
+} 
