@@ -302,36 +302,57 @@ class API_Handler {
     public function get_relation_by_email($email) {
         $this->logger->info('Searching for relation with email: ' . $email);
 
-        $page      = 1;
-        $page_size = 250;
-        $needle    = strtolower(trim($email));
+        $page            = 1;
+        $page_size       = 250;
+        $needle          = $this->normalize_customer_email($email);
+        $seen_page_hashes = array();
 
-        do {
+        while (true) {
             $response = $this->get('relations', array('PageIndex' => $page, 'PageSize' => $page_size));
 
             if (is_wp_error($response)) {
                 return $response;
             }
 
-            if (empty($response['Data']) || !is_array($response['Data'])) {
-                break;
+            // Do not assume a short page or TotalCount means that the complete
+            // relation list was returned. Only an explicit empty page proves
+            // there are no more relations to check.
+            if (!is_array($response) || !array_key_exists('Data', $response) || !is_array($response['Data'])) {
+                $error = new \WP_Error(
+                    'invalid_relation_lookup_response',
+                    __('Powerall returned an invalid relations page. Customer creation was stopped to prevent a duplicate.', 'dsn-woo-powerall')
+                );
+                $this->logger->error($error->get_error_message() . ' Page: ' . $page);
+                return $error;
             }
 
+            if ($response['Data'] === array()) {
+                $this->logger->info('Finished checking every Powerall relation page for email: ' . $needle);
+                return null;
+            }
+
+            // If the API ignores PageIndex and sends a previous page again, we
+            // cannot establish that every relation was checked. Stop safely.
+            $page_hash = md5(wp_json_encode($response['Data']));
+            if (isset($seen_page_hashes[$page_hash])) {
+                $error = new \WP_Error(
+                    'incomplete_relation_lookup',
+                    __('Powerall repeated a relations page. Customer creation was stopped to prevent a duplicate.', 'dsn-woo-powerall')
+                );
+                $this->logger->error($error->get_error_message() . ' Repeated page: ' . $page);
+                return $error;
+            }
+            $seen_page_hashes[$page_hash] = true;
+
             foreach ($response['Data'] as $relation) {
-                if (isset($relation['EmailAddress']) && strtolower(trim($relation['EmailAddress'])) === $needle) {
+                if (isset($relation['EmailAddress']) && $this->normalize_customer_email($relation['EmailAddress']) === $needle) {
                     $this->logger->info('Found relation with code: ' . ($relation['RelationCode'] ?? 'N/A') . ' on page ' . $page);
                     return $relation;
                 }
             }
 
-            $fetched   = count($response['Data']);
-            $total     = isset($response['TotalCount']) ? (int) $response['TotalCount'] : 0;
-            $has_more  = $total > 0 ? ($page * $page_size) < $total : $fetched >= $page_size;
             $page++;
-        } while ($has_more);
-
-        $this->logger->info('No relation found with email: ' . $email);
-        return null;
+        }
     }
 
     /**
@@ -391,7 +412,7 @@ class API_Handler {
      * @param array $customer_data Customer data
      * @return array|WP_Error Relation data or error
      */
-    public function create_relation($customer_data) {
+    private function create_relation($customer_data) {
         $this->logger->info('Creating new relation with data: ' . json_encode($customer_data));
 
         // Resolve address fields — support both flat billing_address and nested customer.address structures.
@@ -460,8 +481,19 @@ class API_Handler {
      * @return array|WP_Error Relation data or error
      */
     public function get_or_create_relation($customer_data) {
-        $email      = strtolower(trim($customer_data['customer']['email'] ?? ''));
+        $email      = $this->normalize_customer_email($customer_data['customer']['email'] ?? '');
         $wp_user_id = !empty($customer_data['customer_id']) ? (int) $customer_data['customer_id'] : 0;
+
+        if ($email === '') {
+            return new \WP_Error(
+                'missing_customer_email',
+                __('A customer email address is required to create a Powerall relation.', 'dsn-woo-powerall')
+            );
+        }
+
+        // Always use one canonical value for both the lookup and any creation.
+        // Email addresses are treated as case-insensitive identifiers by this integration.
+        $customer_data['customer']['email'] = $email;
 
         // 1. Check WP user meta cache first — avoids API round-trip for returning customers.
         if ($wp_user_id > 0) {
@@ -472,29 +504,40 @@ class API_Handler {
             }
         }
 
-        // 2. Search by email across all pages.
-        $relation = $this->get_relation_by_email($email);
-
-        if (is_wp_error($relation)) {
-            return $relation;
+        // 2. Serialize lookup-and-create requests for this email. Without this,
+        // two simultaneous guest checkouts could both see no relation and create one.
+        $lock_token = $this->acquire_relation_email_lock($email);
+        if (is_wp_error($lock_token)) {
+            return $lock_token;
         }
 
-        // 3. Create if not found.
-        if (!$relation) {
-            $this->logger->info('No existing relation found for ' . $email . ', creating new one');
-            $relation = $this->create_relation($customer_data);
+        try {
+            // Search again while holding the lock, including every API page.
+            $relation = $this->get_relation_by_email($email);
 
             if (is_wp_error($relation)) {
                 return $relation;
             }
 
-            if (empty($relation['Id'])) {
-                $error = new \WP_Error('invalid_response', 'No relation ID returned after create');
-                $this->logger->error($error->get_error_message());
-                return $error;
+            // 3. Create only when the case-insensitive search found no match.
+            if (!$relation) {
+                $this->logger->info('No existing relation found for ' . $email . ', creating new one');
+                $relation = $this->create_relation($customer_data);
+
+                if (is_wp_error($relation)) {
+                    return $relation;
+                }
+
+                if (empty($relation['Id'])) {
+                    $error = new \WP_Error('invalid_response', 'No relation ID returned after create');
+                    $this->logger->error($error->get_error_message());
+                    return $error;
+                }
+            } else {
+                $this->logger->info('Found existing relation with ID: ' . $relation['Id']);
             }
-        } else {
-            $this->logger->info('Found existing relation with ID: ' . $relation['Id']);
+        } finally {
+            $this->release_relation_email_lock($email, $lock_token);
         }
 
         // 4. Cache relation ID in WP user meta so future orders skip the search.
@@ -504,6 +547,77 @@ class API_Handler {
         }
 
         return $relation;
+    }
+
+    /**
+     * Acquire a short, database-backed lock for a normalized email address.
+     *
+     * add_option() is atomic at the WordPress database level, so it also works
+     * when requests run in separate PHP workers.
+     *
+     * @param string $email Normalized email address
+     * @return string|WP_Error Lock token or error
+     */
+    private function acquire_relation_email_lock($email) {
+        $option_name = '_dsn_powerall_relation_lock_' . md5($email);
+        // A relation lookup and a create request can each take up to the API
+        // client's 30-second timeout, so the lock must outlive both requests.
+        $expires_at  = time() + 90;
+        $wait_until  = microtime(true) + 45;
+        $token       = wp_generate_uuid4();
+
+        do {
+            if (add_option($option_name, $token . ':' . $expires_at, '', 'no')) {
+                return $token;
+            }
+
+            // A crashed request must not prevent future checkouts forever.
+            $current_lock = (string) get_option($option_name, '');
+            $lock_expires = (int) strrchr($current_lock, ':');
+            if ($lock_expires < time()) {
+                delete_option($option_name);
+                continue;
+            }
+
+            usleep(250000);
+        } while (microtime(true) < $wait_until);
+
+        return new \WP_Error(
+            'relation_creation_in_progress',
+            __('Customer creation is already in progress for this email address. Please try again.', 'dsn-woo-powerall')
+        );
+    }
+
+    /**
+     * Release the lock acquired by acquire_relation_email_lock().
+     *
+     * @param string $email Normalized email address
+     * @param string $token Lock token returned from acquire_relation_email_lock()
+     * @return void
+     */
+    private function release_relation_email_lock($email, $token) {
+        $option_name  = '_dsn_powerall_relation_lock_' . md5($email);
+        $current_lock = (string) get_option($option_name, '');
+
+        // Never remove a lock acquired by a later request after this request's
+        // lock expired or was reclaimed.
+        if (str_starts_with($current_lock, $token . ':')) {
+            delete_option($option_name);
+        }
+    }
+
+    /**
+     * Normalize an email for case-insensitive customer matching.
+     *
+     * @param string $email Email address
+     * @return string
+     */
+    private function normalize_customer_email($email) {
+        $email = trim((string) $email);
+
+        return function_exists('mb_strtolower')
+            ? mb_strtolower($email, 'UTF-8')
+            : strtolower($email);
     }
 
     /**
