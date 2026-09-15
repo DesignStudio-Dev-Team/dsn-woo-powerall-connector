@@ -51,11 +51,12 @@ class API_Handler {
      *
      * @param string $endpoint API endpoint
      * @param array $params Query parameters
+     * @param int $timeout Request timeout in seconds
      * @return array|WP_Error Response data or error
      */
-    public function get($endpoint, $params = array()) {
+    public function get($endpoint, $params = array(), $timeout = 18000) {
         $this->logger->info(sprintf('Making GET request to %s with params: %s', $endpoint, json_encode($params)));
-        return $this->request('GET', $endpoint, $params);
+        return $this->request('GET', $endpoint, $params, array(), $timeout);
     }
 
     /**
@@ -63,11 +64,12 @@ class API_Handler {
      *
      * @param string $endpoint API endpoint
      * @param array $data Request data
+     * @param int $timeout Request timeout in seconds
      * @return array|WP_Error Response data or error
      */
-    public function post($endpoint, $data = array()) {
+    public function post($endpoint, $data = array(), $timeout = 18000) {
         $this->logger->info(sprintf('Making POST request to %s with data: %s', $endpoint, json_encode($data)));
-        return $this->request('POST', $endpoint, array(), $data);
+        return $this->request('POST', $endpoint, array(), $data, $timeout);
     }
 
     /**
@@ -75,11 +77,12 @@ class API_Handler {
      *
      * @param string $endpoint API endpoint
      * @param array $data Request data
+     * @param int $timeout Request timeout in seconds
      * @return array|WP_Error Response data or error
      */
-    public function put($endpoint, $data = array()) {
+    public function put($endpoint, $data = array(), $timeout = 18000) {
         $this->logger->info(sprintf('Making PUT request to %s with data: %s', $endpoint, json_encode($data)));
-        return $this->request('PUT', $endpoint, array(), $data);
+        return $this->request('PUT', $endpoint, array(), $data, $timeout);
     }
 
     /**
@@ -89,9 +92,10 @@ class API_Handler {
      * @param string $endpoint API endpoint
      * @param array $params Query parameters
      * @param array $data Request data
+     * @param int $timeout Request timeout in seconds
      * @return array|WP_Error Response data or error
      */
-    private function request($method, $endpoint, $params = array(), $data = array()) {
+    private function request($method, $endpoint, $params = array(), $data = array(), $timeout = 18000) {
         if (empty($this->tenant_name) || empty($this->token)) {
             $error = new \WP_Error(
                 'api_credentials_missing',
@@ -121,7 +125,7 @@ class API_Handler {
         $args = array(
             'method' => $method,
             'headers' => $headers,
-            'timeout' => 30,
+            'timeout' => 18000,
         );
 
         if (!empty($data)) {
