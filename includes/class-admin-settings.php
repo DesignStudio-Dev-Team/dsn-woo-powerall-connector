@@ -349,6 +349,13 @@ class Admin_Settings {
             }
         }
 
+        if (
+            isset($_POST['dsn_woo_powerall_reverse_audit_matches']) &&
+            check_admin_referer('dsn_woo_powerall_reverse_audit_matches', 'dsn_woo_powerall_reverse_audit_matches_nonce')
+        ) {
+            $this->run_reverse_sku_match_audit();
+        }
+
         settings_errors('dsn_woo_powerall_messages');
 
         if ($view === 'sync-progress') {
@@ -398,7 +405,7 @@ class Admin_Settings {
 
             <hr>
 
-            <h2><?php esc_html_e('Audit SKU Matches', 'dsn-woo-powerall'); ?></h2>
+            <h2><?php esc_html_e('Audit SKU Matches (Powerall → WooCommerce)', 'dsn-woo-powerall'); ?></h2>
             <p><?php esc_html_e('Fetch every product from Powerall and report which records fail to match a WooCommerce SKU. Match priority: ProductCode → EanCode.', 'dsn-woo-powerall'); ?></p>
             <form method="post" action="">
                 <?php wp_nonce_field('dsn_woo_powerall_audit_matches', 'dsn_woo_powerall_audit_matches_nonce'); ?>
@@ -408,6 +415,15 @@ class Admin_Settings {
             <?php if (is_array($audit_report)) : ?>
                 <?php $this->render_audit_report($audit_report); ?>
             <?php endif; ?>
+
+            <hr>
+
+            <h2><?php esc_html_e('Audit Reverse SKU Matches (WooCommerce → Powerall)', 'dsn-woo-powerall'); ?></h2>
+            <p><?php esc_html_e('Scan every WooCommerce product and report which records fail to match a Powerall product by SKU.', 'dsn-woo-powerall'); ?></p>
+            <form method="post" action="">
+                <?php wp_nonce_field('dsn_woo_powerall_reverse_audit_matches', 'dsn_woo_powerall_reverse_audit_matches_nonce'); ?>
+                <input type="submit" name="dsn_woo_powerall_reverse_audit_matches" class="button button-secondary" value="<?php esc_attr_e('Run reverse SKU audit', 'dsn-woo-powerall'); ?>">
+            </form>
         </div>
         <?php
     }
@@ -430,8 +446,27 @@ class Admin_Settings {
             return new \WP_Error('invalid_response', __('Powerall returned an unexpected response.', 'dsn-woo-powerall'));
         }
 
+        $flattened_products = array();
+        foreach ($products as $item) {
+            if (is_array($item) && !isset($item['ProductCode'])) {
+                if (is_array($item)) {
+                    foreach ($item as $product) {
+                        if (is_array($product) && isset($product['ProductCode'])) {
+                            $flattened_products[] = $product;
+                        }
+                    }
+                }
+            } elseif (is_array($item) && isset($item['ProductCode'])) {
+                $flattened_products[] = $item;
+            }
+        }
+
+        if (empty($flattened_products)) {
+            $flattened_products = $products;
+        }
+
         $report = array(
-            'total'                   => count($products),
+            'total'                   => count($flattened_products),
             'matched_count'           => 0,
             'matched_by_product_code' => 0,
             'matched_by_ean_code'     => 0,
@@ -440,7 +475,7 @@ class Admin_Settings {
             'duplicates'              => array(),
         );
 
-        foreach ($products as $record) {
+        foreach ($flattened_products as $record) {
             if (!is_array($record)) {
                 continue;
             }
@@ -524,6 +559,403 @@ class Admin_Settings {
         ));
 
         return $row ? (int) $row : 0;
+    }
+
+    /**
+     * Check each WooCommerce product to see if it has a matching Powerall product.
+     * Returns nothing directly; logs results and sends email (commented out).
+     *
+     * @return void
+     */
+    private function run_reverse_sku_match_audit() {
+        require_once __DIR__ . '/class-api-handler.php';
+        require_once __DIR__ . '/class-reverse-audit-logger.php';
+
+        $audit_logger = new Reverse_Audit_Logger();
+        $api_handler = new API_Handler();
+
+        $audit_logger->log('=== Reverse SKU Audit Started ===');
+        $audit_logger->log('Fetching all Powerall products...');
+
+        $powerall_products = $api_handler->get_products();
+
+        if (is_wp_error($powerall_products)) {
+            $error_msg = $powerall_products->get_error_message();
+            $audit_logger->log('ERROR: Failed to fetch Powerall products: ' . $error_msg);
+            add_settings_error(
+                'dsn_woo_powerall_messages',
+                'dsn_woo_powerall_message',
+                $error_msg,
+                'error'
+            );
+            return;
+        }
+
+        if (!is_array($powerall_products)) {
+            $error_msg = __('Powerall returned an unexpected response.', 'dsn-woo-powerall');
+            $audit_logger->log('ERROR: ' . $error_msg);
+            add_settings_error(
+                'dsn_woo_powerall_messages',
+                'dsn_woo_powerall_message',
+                $error_msg,
+                'error'
+            );
+            return;
+        }
+
+        $flattened_products = array();
+        foreach ($powerall_products as $item) {
+            if (is_array($item) && !isset($item['ProductCode'])) {
+                if (is_array($item)) {
+                    foreach ($item as $product) {
+                        if (is_array($product) && isset($product['ProductCode'])) {
+                            $flattened_products[] = $product;
+                        }
+                    }
+                }
+            } elseif (is_array($item) && isset($item['ProductCode'])) {
+                $flattened_products[] = $item;
+            }
+        }
+
+        if (empty($flattened_products)) {
+            $flattened_products = $powerall_products;
+        }
+
+        $audit_logger->log('Processing ' . count($flattened_products) . ' products');
+
+        $powerall_skus = array();
+        $sample_product = null;
+        foreach ($flattened_products as $record) {
+            if (!is_array($record)) {
+                continue;
+            }
+            if ($sample_product === null) {
+                $sample_product = $record;
+                $audit_logger->log('Sample product: ProductCode=' . ($record['ProductCode'] ?? 'N/A') . ', EanCode=' . ($record['EanCode'] ?? 'N/A'));
+            }
+
+            $product_code = isset($record['ProductCode']) ? trim((string) $record['ProductCode']) : '';
+            $ean_code = isset($record['EanCode']) ? trim((string) $record['EanCode']) : '';
+
+            if ($product_code !== '') {
+                $powerall_skus[$product_code] = true;
+            }
+            if ($ean_code !== '' && $ean_code !== $product_code) {
+                $powerall_skus[$ean_code] = true;
+            }
+        }
+
+        $audit_logger->log('Found ' . count($powerall_skus) . ' unique SKUs in Powerall');
+        $audit_logger->log('Full sample product: ' . json_encode($sample_product));
+
+        global $wpdb;
+        $woo_products = $wpdb->get_results(
+            "SELECT ID, post_title FROM {$wpdb->posts} WHERE post_type = 'product' AND post_status = 'publish'"
+        );
+
+        $audit_logger->log('Found ' . count($woo_products) . ' WooCommerce products');
+
+        $report = array(
+            'total' => count($woo_products),
+            'matched' => 0,
+            'unmatched' => array(),
+        );
+
+        foreach ($woo_products as $woo_product) {
+            $product_id = (int) $woo_product->ID;
+            $sku = (string) get_post_meta($product_id, '_sku', true);
+
+            if (empty($sku)) {
+                $report['unmatched'][] = array(
+                    'product_id' => $product_id,
+                    'product_name' => $woo_product->post_title,
+                    'sku' => '',
+                    'reason' => __('WooCommerce product has no SKU', 'dsn-woo-powerall'),
+                );
+                continue;
+            }
+
+            if (isset($powerall_skus[$sku])) {
+                $report['matched']++;
+            } else {
+                $report['unmatched'][] = array(
+                    'product_id' => $product_id,
+                    'product_name' => $woo_product->post_title,
+                    'sku' => $sku,
+                    'reason' => __('No Powerall product with matching ProductCode or EanCode', 'dsn-woo-powerall'),
+                );
+            }
+        }
+
+        $audit_logger->log('Audit complete: ' . $report['matched'] . ' matched, ' . count($report['unmatched']) . ' unmatched');
+        $audit_logger->log('=== Reverse SKU Audit Ended ===');
+        $audit_logger->log('');
+
+        $html_file = $this->generate_reverse_audit_html_report($report);
+
+        $this->send_reverse_audit_email($report, $audit_logger);
+
+        $message = sprintf(
+            /* translators: 1: matched count, 2: total WooCommerce products */
+            __('Reverse SKU audit complete. %1$d of %2$d WooCommerce products matched a Powerall product. Results logged to reverse audit log.', 'dsn-woo-powerall'),
+            $report['matched'],
+            $report['total']
+        );
+
+        if ($html_file) {
+            $audit_logger->log('HTML report generated: ' . $html_file);
+            $message .= ' ' . sprintf(
+                __('<a href="%s" target="_blank">View HTML Report</a>', 'dsn-woo-powerall'),
+                esc_url($html_file)
+            );
+        }
+
+        add_settings_error(
+            'dsn_woo_powerall_messages',
+            'dsn_woo_powerall_message',
+            $message,
+            'updated'
+        );
+    }
+
+    /**
+     * Send reverse audit email to site owner (commented out).
+     *
+     * @param array $report The audit report
+     * @param Reverse_Audit_Logger $audit_logger The audit logger
+     * @return void
+     */
+    private function send_reverse_audit_email($report, $audit_logger) {
+        $unmatched_count = count($report['unmatched']);
+        $matched_count = $report['matched'];
+        $total = $report['total'];
+
+        $subject = sprintf(
+            __('[%s] Reverse SKU Audit Report: %d of %d WooCommerce products matched', 'dsn-woo-powerall'),
+            get_bloginfo('name'),
+            $matched_count,
+            $total
+        );
+
+        $message = sprintf(
+            __("Reverse SKU Audit Report\n\n" .
+            "Total WooCommerce Products: %d\n" .
+            "Matched to Powerall: %d\n" .
+            "Unmatched: %d\n\n" .
+            "Unmatched Products:\n", 'dsn-woo-powerall'),
+            $total,
+            $matched_count,
+            $unmatched_count
+        );
+
+        foreach ($report['unmatched'] as $product) {
+            $message .= sprintf(
+                "- %s (SKU: %s) - %s\n",
+                $product['product_name'],
+                $product['sku'] ?: '(empty)',
+                $product['reason']
+            );
+        }
+
+        $message .= "\n" . __('Full details are available in the reverse audit log file.', 'dsn-woo-powerall');
+
+        $admin_email = get_option('admin_email');
+
+        // Email commented out - uncomment when ready to send
+        // wp_mail($admin_email, $subject, $message);
+        // $audit_logger->log('Email sent to: ' . $admin_email);
+    }
+
+    /**
+     * Generate HTML report for unmatched products.
+     *
+     * @param array $report The audit report
+     * @return string|false URL to the HTML file or false on error
+     */
+    private function generate_reverse_audit_html_report($report) {
+        $upload_dir = wp_upload_dir();
+        $html_file = $upload_dir['basedir'] . '/dsn-woo-powerall-reverse-audit-report.html';
+
+        $unmatched_count = count($report['unmatched']);
+        $html = '<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reverse SKU Audit Report - Unmatched Products</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen-Sans, Ubuntu, Cantarell, "Helvetica Neue", sans-serif;
+            background-color: #f1f1f1;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            padding: 30px;
+            border-radius: 5px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        h1 {
+            margin-bottom: 10px;
+            color: #333;
+        }
+        .summary {
+            background: #f9f9f9;
+            padding: 15px;
+            margin-bottom: 30px;
+            border-left: 4px solid #0073aa;
+            border-radius: 3px;
+        }
+        .summary p {
+            margin: 8px 0;
+            color: #666;
+        }
+        .products-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 20px;
+        }
+        .product-card {
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            overflow: hidden;
+            transition: box-shadow 0.3s ease;
+        }
+        .product-card:hover {
+            box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+        }
+        .product-image {
+            width: 100%;
+            height: 200px;
+            object-fit: cover;
+            background-color: #f5f5f5;
+        }
+        .product-info {
+            padding: 15px;
+        }
+        .product-name {
+            font-weight: 600;
+            font-size: 16px;
+            margin-bottom: 8px;
+            color: #333;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+        .product-sku {
+            font-size: 13px;
+            color: #999;
+            margin-bottom: 10px;
+        }
+        .product-reason {
+            font-size: 12px;
+            color: #d9534f;
+            margin-bottom: 12px;
+            line-height: 1.4;
+        }
+        .edit-button {
+            display: inline-block;
+            background-color: #0073aa;
+            color: white;
+            padding: 8px 12px;
+            text-decoration: none;
+            border-radius: 3px;
+            font-size: 13px;
+            transition: background-color 0.2s;
+        }
+        .edit-button:hover {
+            background-color: #005a87;
+            color: white;
+        }
+        .no-image {
+            width: 100%;
+            height: 200px;
+            background-color: #f5f5f5;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #999;
+            font-size: 14px;
+        }
+        .footer {
+            margin-top: 30px;
+            text-align: center;
+            color: #999;
+            font-size: 12px;
+            border-top: 1px solid #ddd;
+            padding-top: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Reverse SKU Audit Report</h1>
+        <div class="summary">
+            <p><strong>Total Products Scanned:</strong> ' . absint($report['total']) . '</p>
+            <p><strong>Matched with Powerall:</strong> ' . absint($report['matched']) . '</p>
+            <p><strong>Unmatched Products:</strong> <strong style="color: #d9534f;">' . absint($unmatched_count) . '</strong></p>
+            <p><strong>Report Generated:</strong> ' . wp_date('Y-m-d H:i:s') . '</p>
+        </div>';
+
+        if (empty($report['unmatched'])) {
+            $html .= '<p style="padding: 20px; background: #dff0d8; border: 1px solid #d6e9c6; border-radius: 3px; color: #3c763d;">
+                All WooCommerce products have matching Powerall records!
+            </p>';
+        } else {
+            $html .= '<div class="products-grid">';
+
+            foreach ($report['unmatched'] as $product) {
+                $product_id = $product['product_id'];
+                $woo_product = wc_get_product($product_id);
+
+                if (!$woo_product) {
+                    continue;
+                }
+
+                $image_url = '';
+                $image = $woo_product->get_image_id();
+                if ($image) {
+                    $image_url = wp_get_attachment_url($image);
+                }
+
+                $edit_url = get_edit_post_link($product_id, 'raw');
+
+                $html .= '<div class="product-card">
+                    ' . ($image_url ? '<img src="' . esc_attr($image_url) . '" alt="' . esc_attr($product['product_name']) . '" class="product-image">' : '<div class="no-image">No Image</div>') . '
+                    <div class="product-info">
+                        <div class="product-name">' . esc_html($product['product_name']) . '</div>
+                        ' . ($product['sku'] ? '<div class="product-sku">SKU: ' . esc_html($product['sku']) . '</div>' : '<div class="product-sku">SKU: (empty)</div>') . '
+                        <div class="product-reason">' . esc_html($product['reason']) . '</div>
+                        ' . ($edit_url ? '<a href="' . esc_url($edit_url) . '" class="edit-button" target="_blank">Edit Product</a>' : '') . '
+                    </div>
+                </div>';
+            }
+
+            $html .= '</div>';
+        }
+
+        $html .= '
+        <div class="footer">
+            <p>Generated by DSN Woo To Powerall Connector</p>
+        </div>
+    </div>
+</body>
+</html>';
+
+        if (file_put_contents($html_file, $html) === false) {
+            return false;
+        }
+
+        return $upload_dir['baseurl'] . '/dsn-woo-powerall-reverse-audit-report.html';
     }
 
     /**

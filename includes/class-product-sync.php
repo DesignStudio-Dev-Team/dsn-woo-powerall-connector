@@ -549,15 +549,15 @@ class Product_Sync {
 
                         wc_update_product_lookup_tables($product_id);
 
-                        $this->logger->info ('aaa get_regular_price: ' . json_encode ($product->get_regular_price ()));
-                        $this->logger->info ('---');
+                        // $this->logger->info ('aaa get_regular_price: ' . json_encode ($product->get_regular_price ()));
+                        // $this->logger->info ('---');
 
 
                     } else {
                         $product->set_sale_price($new_price);
                         $product->save();
-                        $this->logger->info ('bbb get_regular_price: ' . json_encode ($product->get_regular_price ()));
-                        $this->logger->info ('---');
+                        // $this->logger->info ('bbb get_regular_price: ' . json_encode ($product->get_regular_price ()));
+                        // $this->logger->info ('---');
                     }
 
 
