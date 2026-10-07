@@ -31,6 +31,13 @@ class API_Handler {
     private $logger;
 
     /**
+     * Relation cache instance
+     *
+     * @var Relation_Cache|null
+     */
+    private $relation_cache = null;
+
+    /**
      * Constructor
      */
     public function __construct() {
@@ -142,9 +149,11 @@ class API_Handler {
         }
 
         $body = wp_remote_retrieve_body($response);
-        $data = json_decode($body, true);
+        $status = (int) wp_remote_retrieve_response_code($response);
+        // Powerall answers some errors (e.g. 404 for an unknown product) with an empty body.
+        $data = trim($body) === '' && ($status < 200 || $status >= 300) ? array() : json_decode($body, true);
 
-        if (json_last_error() !== JSON_ERROR_NONE) {
+        if ($data !== array() && json_last_error() !== JSON_ERROR_NONE) {
             $error = new \WP_Error('invalid_response', __('Invalid response from Powerall API.', 'dsn-woo-powerall'));
             $this->logger->error(sprintf('Invalid JSON response: %s', $body));
             return $error;
@@ -306,57 +315,45 @@ class API_Handler {
     public function get_relation_by_email($email) {
         $this->logger->info('Searching for relation with email: ' . $email);
 
-        $page            = 1;
-        $page_size       = 250;
-        $needle          = $this->normalize_customer_email($email);
-        $seen_page_hashes = array();
-
-        while (true) {
-            $response = $this->get('relations', array('PageIndex' => $page, 'PageSize' => $page_size));
-
-            if (is_wp_error($response)) {
-                return $response;
-            }
-
-            // Do not assume a short page or TotalCount means that the complete
-            // relation list was returned. Only an explicit empty page proves
-            // there are no more relations to check.
-            if (!is_array($response) || !array_key_exists('Data', $response) || !is_array($response['Data'])) {
-                $error = new \WP_Error(
-                    'invalid_relation_lookup_response',
-                    __('Powerall returned an invalid relations page. Customer creation was stopped to prevent a duplicate.', 'dsn-woo-powerall')
-                );
-                $this->logger->error($error->get_error_message() . ' Page: ' . $page);
-                return $error;
-            }
-
-            if ($response['Data'] === array()) {
-                $this->logger->info('Finished checking every Powerall relation page for email: ' . $needle);
-                return null;
-            }
-
-            // If the API ignores PageIndex and sends a previous page again, we
-            // cannot establish that every relation was checked. Stop safely.
-            $page_hash = md5(wp_json_encode($response['Data']));
-            if (isset($seen_page_hashes[$page_hash])) {
-                $error = new \WP_Error(
-                    'incomplete_relation_lookup',
-                    __('Powerall repeated a relations page. Customer creation was stopped to prevent a duplicate.', 'dsn-woo-powerall')
-                );
-                $this->logger->error($error->get_error_message() . ' Repeated page: ' . $page);
-                return $error;
-            }
-            $seen_page_hashes[$page_hash] = true;
-
-            foreach ($response['Data'] as $relation) {
-                if (isset($relation['EmailAddress']) && $this->normalize_customer_email($relation['EmailAddress']) === $needle) {
-                    $this->logger->info('Found relation with code: ' . ($relation['RelationCode'] ?? 'N/A') . ' on page ' . $page);
-                    return $relation;
-                }
-            }
-
-            $page++;
+        // Powerall's /relations endpoint has no email filter and ignores
+        // PageIndex/PageSize, so look the email up in the local relation cache
+        // after pulling in any relations changed since its last refresh.
+        $cache = $this->get_relation_cache();
+        $refresh = $cache->refresh();
+        if (is_wp_error($refresh)) {
+            $error = new \WP_Error(
+                'incomplete_relation_lookup',
+                sprintf(
+                    /* translators: %s: underlying error message */
+                    __('Could not refresh the Powerall customer list (%s). Customer creation was stopped to prevent a duplicate.', 'dsn-woo-powerall'),
+                    $refresh->get_error_message()
+                )
+            );
+            $this->logger->error($error->get_error_message());
+            return $error;
         }
+
+        $relation = $cache->find_by_email($email);
+        if ($relation) {
+            $this->logger->info('Found relation with code: ' . $relation['RelationCode'] . ' in the relation cache');
+            return $relation;
+        }
+
+        $this->logger->info('No relation found in the relation cache for email: ' . $this->normalize_customer_email($email));
+        return null;
+    }
+
+    /**
+     * Local email -> relation index used for duplicate checks.
+     *
+     * @return Relation_Cache
+     */
+    public function get_relation_cache() {
+        if ($this->relation_cache === null) {
+            $this->relation_cache = new Relation_Cache($this);
+        }
+
+        return $this->relation_cache;
     }
 
     /**
@@ -537,6 +534,16 @@ class API_Handler {
                     $this->logger->error($error->get_error_message());
                     return $error;
                 }
+
+                // The next checkout with this email must find it even before
+                // the incremental sync sees it in Powerall.
+                $this->get_relation_cache()->store_relation(array(
+                    'Id' => $relation['Id'],
+                    'RelationCode' => $relation['RelationCode'] ?? 0,
+                    'EmailAddress' => $email,
+                    'Active' => true,
+                    'LastModified' => $relation['LastModified'] ?? '',
+                ));
             } else {
                 $this->logger->info('Found existing relation with ID: ' . $relation['Id']);
             }
@@ -577,7 +584,8 @@ class API_Handler {
 
             // A crashed request must not prevent future checkouts forever.
             $current_lock = (string) get_option($option_name, '');
-            $lock_expires = (int) strrchr($current_lock, ':');
+            // strrchr() keeps the ":" prefix, which (int) would turn into 0.
+            $lock_expires = (int) substr((string) strrchr($current_lock, ':'), 1);
             if ($lock_expires < time()) {
                 delete_option($option_name);
                 continue;
@@ -700,6 +708,23 @@ class API_Handler {
         ));
         
         return $this->post($endpoint, $sales_order);
+    }
+
+    /**
+     * Check whether a product code exists in Powerall.
+     *
+     * @param string $product_code Powerall ProductCode
+     * @return bool|\WP_Error True if it exists, false on 404, WP_Error when Powerall could not be asked
+     */
+    public function product_exists($product_code) {
+        $response = $this->get('products/' . rawurlencode($product_code));
+
+        if (is_wp_error($response)) {
+            $data = $response->get_error_data();
+            return is_array($data) && (int) ($data['status'] ?? 0) === 404 ? false : $response;
+        }
+
+        return !empty($response['Data']);
     }
 
         /**

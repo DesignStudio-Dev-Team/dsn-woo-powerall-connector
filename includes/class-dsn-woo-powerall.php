@@ -52,6 +52,13 @@ class DSN_Woo_Powerall {
     private $order_sync;
 
     /**
+     * Failure alert sender.
+     *
+     * @var Sync_Notifier
+     */
+    private $sync_notifier;
+
+    /**
      * Initialize the plugin.
      *
      * @return void
@@ -235,6 +242,8 @@ class DSN_Woo_Powerall {
     private function load_dependencies() {
         require_once DSN_WOO_POWERALL_PLUGIN_DIR . 'includes/class-logger.php';
         require_once DSN_WOO_POWERALL_PLUGIN_DIR . 'includes/class-api-handler.php';
+        require_once DSN_WOO_POWERALL_PLUGIN_DIR . 'includes/class-relation-cache.php';
+        require_once DSN_WOO_POWERALL_PLUGIN_DIR . 'includes/class-sync-notifier.php';
         require_once DSN_WOO_POWERALL_PLUGIN_DIR . 'includes/class-admin-settings.php';
         require_once DSN_WOO_POWERALL_PLUGIN_DIR . 'includes/class-product-sync.php';
         require_once DSN_WOO_POWERALL_PLUGIN_DIR . 'includes/class-order-sync.php';
@@ -256,7 +265,8 @@ class DSN_Woo_Powerall {
         $this->logger = new Logger();
         $this->admin_settings = new Admin_Settings();
         $this->product_sync = new Product_Sync($this->api_handler);
-        $this->order_sync = new Order_Sync($this->api_handler);
+        $this->sync_notifier = new Sync_Notifier();
+        $this->order_sync = new Order_Sync($this->api_handler, $this->sync_notifier);
         new Stock_Display();
         if (is_admin()) {
             new Product_Meta_Box();
@@ -300,6 +310,12 @@ class DSN_Woo_Powerall {
             wp_schedule_event(time() + DAY_IN_SECONDS, 'dsn_woo_powerall_fortnightly', 'dsn_woo_powerall_biweekly_clear_logs');
         }
 
+        // Daily refresh of the local email -> Powerall relation index used for duplicate checks.
+        if (!wp_next_scheduled(Relation_Cache::CRON_HOOK)) {
+            wp_schedule_event(time() + MINUTE_IN_SECONDS, 'daily', Relation_Cache::CRON_HOOK);
+        }
+        add_action(Relation_Cache::CRON_HOOK, array($this, 'run_relation_cache_sync_cron'));
+
         add_action(self::DAILY_SYNC_HOOK, array($this, 'run_daily_product_sync_cron'));
         add_action(self::DAILY_SYNC_BATCH_HOOK, array($this, 'run_daily_product_sync_cron_batch'));
         add_action(self::DAILY_SYNC_START_RETRY_HOOK, array($this, 'run_daily_product_sync_cron'));
@@ -313,7 +329,23 @@ class DSN_Woo_Powerall {
         // Back-compat: still run the handler if the legacy hook fires (another cron runner may trigger it once).
         add_action('dsn_woo_powerall_weekly_clear_logs', array($this, 'clear_all_logs'));
 
-        add_action('woocommerce_checkout_order_processed', array($this->order_sync, 'handle_new_order'), 10, 1);
+        // Send orders to Powerall once they are paid, not at checkout, so
+        // abandoned payments never reach Powerall. Mollie moves paid orders to
+        // processing (bank transfers wait in on-hold until the money arrives).
+        add_option(Order_Sync::SEND_ON_PAYMENT_SINCE_OPTION, time(), '', 'no');
+        add_action('woocommerce_order_status_processing', array($this->order_sync, 'handle_paid_order'), 10, 1);
+        add_action('woocommerce_order_status_completed', array($this->order_sync, 'handle_paid_order'), 10, 1);
+
+        // Manual resend from the order edit screen.
+        add_filter('woocommerce_order_actions', array($this->order_sync, 'add_resend_order_action'), 10, 2);
+        add_action('woocommerce_order_action_dsn_powerall_send_order', array($this->order_sync, 'handle_resend_order_action'));
+
+        // Alert when a paid order is not in Powerall, plus a daily safety-net check.
+        add_action('woocommerce_order_status_changed', array($this->sync_notifier, 'handle_status_change'), 20, 4);
+        if (!wp_next_scheduled(Sync_Notifier::CHECK_HOOK)) {
+            wp_schedule_event(time() + HOUR_IN_SECONDS, 'daily', Sync_Notifier::CHECK_HOOK);
+        }
+        add_action(Sync_Notifier::CHECK_HOOK, array($this->sync_notifier, 'run_daily_check'));
 
         add_action('admin_menu', array($this->admin_settings, 'add_admin_menu'));
         add_action('wp_ajax_dsn_woo_powerall_cleanup', array($this, 'ajax_cleanup_sale_prices'));
@@ -400,6 +432,20 @@ class DSN_Woo_Powerall {
         ), false);
 
         return $result;
+    }
+
+    /**
+     * Refresh the Powerall relation cache (incremental, weekly full load).
+     *
+     * @return array|\WP_Error
+     */
+    public function run_relation_cache_sync_cron() {
+        try {
+            return $this->api_handler->get_relation_cache()->run_daily_sync();
+        } catch (\Throwable $e) {
+            $this->logger->error('Powerall relation cache cron failed with an uncaught error: ' . $e->getMessage());
+            throw $e;
+        }
     }
 
     /**
