@@ -40,6 +40,32 @@ class Product_Sync {
     }
 
     /**
+     * Path of a Syndified item's saved JSON (Product, Brand, ...).
+     *
+     * Syndified stores it under uploads; older installs that have not migrated
+     * yet still keep it inside the plugin folder.
+     *
+     * @param string $type Syndified item type folder, e.g. 'Product'
+     * @param int|string $console_id Syndified console ID
+     * @return string The readable path, or the uploads path when neither exists
+     */
+    public static function find_syndified_json_path($type, $console_id) {
+        $upload_dir = wp_upload_dir();
+        $paths = array(
+            trailingslashit($upload_dir['basedir']) . 'syndified/json/' . $type . '/' . $console_id . '.json',
+            trailingslashit(WP_CONTENT_DIR) . 'plugins/syndified/website-content/json/' . $type . '/' . $console_id . '.json',
+        );
+
+        foreach ($paths as $path) {
+            if (file_exists($path) && is_readable($path)) {
+                return $path;
+            }
+        }
+
+        return $paths[0];
+    }
+
+    /**
      * Get the configured batch size for sync requests.
      *
      * @return int
@@ -520,20 +546,7 @@ class Product_Sync {
 
             $this->logger->info('SKU and WordPress IDs: ' . $sku . ': ' . $product_id);
             if ($console_id) {
-                // Syndified stores product JSON under uploads; older installs that have not
-                // migrated yet still keep it inside the plugin folder.
-                $upload_dir    = wp_upload_dir();
-                $console_paths = array(
-                    trailingslashit($upload_dir['basedir']) . 'syndified/json/Product/' . $console_id . '.json',
-                    trailingslashit(WP_CONTENT_DIR) . 'plugins/syndified/website-content/json/Product/' . $console_id . '.json',
-                );
-                $console_path = $console_paths[0];
-                foreach ($console_paths as $candidate_path) {
-                    if (file_exists($candidate_path) && is_readable($candidate_path)) {
-                        $console_path = $candidate_path;
-                        break;
-                    }
-                }
+                $console_path = self::find_syndified_json_path('Product', $console_id);
                 if (file_exists($console_path) && is_readable($console_path)) {
                     $this->logger->info('Found console JSON for product SKU ' . $sku . ': ' . $console_path);
                     $json = file_get_contents($console_path);

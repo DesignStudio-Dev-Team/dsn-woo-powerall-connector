@@ -276,6 +276,18 @@ class Admin_Settings {
 
         $view = isset($_GET['view']) ? sanitize_key(wp_unslash($_GET['view'])) : '';
 
+        $promo_restore = null;
+        $promo_restore_applied = false;
+        if (
+            $this->is_fix_mode() &&
+            (isset($_POST['dsn_woo_powerall_promo_preview']) || isset($_POST['dsn_woo_powerall_promo_apply'])) &&
+            check_admin_referer('dsn_woo_powerall_promo_restore', 'dsn_woo_powerall_promo_restore_nonce')
+        ) {
+            $promo_restore_applied = isset($_POST['dsn_woo_powerall_promo_apply']);
+            $restorer = new Promo_Restore();
+            $promo_restore = $promo_restore_applied ? $restorer->apply() : $restorer->plan();
+        }
+
         if (
             isset($_POST['dsn_woo_powerall_cleanup']) &&
             check_admin_referer('dsn_woo_powerall_cleanup_sale_prices', 'dsn_woo_powerall_cleanup_nonce')
@@ -380,6 +392,11 @@ class Admin_Settings {
             <h1><?php esc_html_e('DSN Woo To Powerall — Tools', 'dsn-woo-powerall'); ?></h1>
             <?php $this->render_nav_tabs('tools'); ?>
 
+            <?php if ($this->is_fix_mode()) : ?>
+                <?php $this->render_promo_restore_section($promo_restore, $promo_restore_applied); ?>
+                <hr>
+            <?php endif; ?>
+
             <h2><?php esc_html_e('Manual Sync', 'dsn-woo-powerall'); ?></h2>
             <p><?php esc_html_e('Open the progress screen to start a manual product sync. The sync runs in smaller batches so you can watch progress and reduce timeout risk on slower hosting.', 'dsn-woo-powerall'); ?></p>
             <form method="post" action="">
@@ -437,6 +454,128 @@ class Admin_Settings {
                 <input type="submit" name="dsn_woo_powerall_reverse_audit_matches" class="button button-secondary" value="<?php esc_attr_e('Run reverse SKU audit', 'dsn-woo-powerall'); ?>">
             </form>
         </div>
+        <?php
+    }
+
+    /**
+     * Whether the Tools page was opened with ?fix=true, which shows one-off repair tools.
+     *
+     * @return bool
+     */
+    private function is_fix_mode() {
+        return isset($_GET['fix']) && sanitize_key(wp_unslash($_GET['fix'])) === 'true';
+    }
+
+    /**
+     * One-off repair: restore Syndified promotion prices the product sync cleared.
+     *
+     * @param array|null $result Promo_Restore plan or apply result, if one was run
+     * @param bool $applied Whether $result comes from apply()
+     * @return void
+     */
+    private function render_promo_restore_section($result, $applied) {
+        $format_price = function ($price) {
+            return $price === '' ? '–' : wp_strip_all_tags(wc_price($price));
+        };
+        $format_date = function ($timestamp) {
+            return $timestamp ? wp_date('Y-m-d H:i', $timestamp) : '–';
+        };
+        ?>
+        <h2><?php esc_html_e('Restore Syndified Promotion Prices', 'dsn-woo-powerall'); ?></h2>
+        <p><?php esc_html_e('Before version 1.2.16 the product sync could not find Syndified\'s product data, so it replaced promotion prices with the normal Powerall price and left the promotion dates behind. This puts back every promotion that is still running or starts later, using the promotion price and dates saved by Syndified, and clears sale dates left on products that have no sale price.', 'dsn-woo-powerall'); ?></p>
+        <p><?php esc_html_e('Preview first: it lists what would change without changing anything.', 'dsn-woo-powerall'); ?></p>
+        <form method="post" action="">
+            <?php wp_nonce_field('dsn_woo_powerall_promo_restore', 'dsn_woo_powerall_promo_restore_nonce'); ?>
+            <input type="submit" name="dsn_woo_powerall_promo_preview" class="button button-secondary" value="<?php esc_attr_e('Preview', 'dsn-woo-powerall'); ?>">
+            <input type="submit" name="dsn_woo_powerall_promo_apply" class="button button-primary" value="<?php esc_attr_e('Restore promotion prices', 'dsn-woo-powerall'); ?>"
+                   onclick="return confirm('<?php echo esc_js(__('Restore the promotion prices and clear leftover sale dates now?', 'dsn-woo-powerall')); ?>');">
+        </form>
+
+        <?php if (!is_array($result)) {
+            return;
+        } ?>
+
+        <div class="notice <?php echo $applied ? (empty($result['errors']) ? 'notice-success' : 'notice-warning') : 'notice-info'; ?> inline" style="margin-top:16px">
+            <p><strong>
+                <?php
+                echo esc_html(sprintf(
+                    $applied
+                        /* translators: 1: restored count, 2: cleared count */
+                        ? __('Done: %1$d promotion prices restored and leftover sale dates cleared on %2$d products.', 'dsn-woo-powerall')
+                        /* translators: 1: restore count, 2: clear count */
+                        : __('Preview: %1$d promotion prices would be restored and leftover sale dates cleared on %2$d products. Nothing has been changed yet.', 'dsn-woo-powerall'),
+                    $applied ? $result['restored'] : count($result['restore']),
+                    $applied ? $result['cleared'] : count($result['clear_dates'])
+                ));
+                ?>
+            </strong></p>
+            <p>
+                <?php
+                echo esc_html(sprintf(
+                    /* translators: 1: checked, 2: already correct, 3: ended, 4: no promotion, 5: no data */
+                    __('Syndified products checked: %1$d. Already correct: %2$d. Promotion ended: %3$d. No promotion: %4$d. No Syndified data found: %5$d.', 'dsn-woo-powerall'),
+                    $result['counts']['checked'],
+                    $result['counts']['already_correct'],
+                    $result['counts']['ended'],
+                    $result['counts']['no_promotion'],
+                    $result['counts']['no_json']
+                ));
+                ?>
+            </p>
+        </div>
+
+        <?php if (!empty($result['errors'])) : ?>
+            <h3><?php esc_html_e('Errors', 'dsn-woo-powerall'); ?></h3>
+            <ul>
+                <?php foreach ($result['errors'] as $error) : ?>
+                    <li><?php echo esc_html($error); ?></li>
+                <?php endforeach; ?>
+            </ul>
+        <?php endif; ?>
+
+        <?php
+        $tables = array(
+            array('items' => $result['restore'], 'reason' => false, 'title' => $applied ? __('Promotion prices restored', 'dsn-woo-powerall') : __('Promotion prices to restore', 'dsn-woo-powerall')),
+            array('items' => $result['clear_dates'], 'reason' => false, 'title' => $applied ? __('Leftover sale dates cleared', 'dsn-woo-powerall') : __('Leftover sale dates to clear', 'dsn-woo-powerall')),
+            array('items' => $result['skipped'], 'reason' => true, 'title' => __('Skipped', 'dsn-woo-powerall')),
+        );
+        foreach ($tables as $table) :
+            if (empty($table['items'])) {
+                continue;
+            }
+            ?>
+            <h3><?php echo esc_html($table['title'] . ' (' . count($table['items']) . ')'); ?></h3>
+            <table class="widefat striped">
+                <thead>
+                    <tr>
+                        <th><?php esc_html_e('Product', 'dsn-woo-powerall'); ?></th>
+                        <th><?php esc_html_e('SKU', 'dsn-woo-powerall'); ?></th>
+                        <th><?php esc_html_e('Regular price', 'dsn-woo-powerall'); ?></th>
+                        <th><?php esc_html_e('Sale price now', 'dsn-woo-powerall'); ?></th>
+                        <th><?php esc_html_e('Promotion price', 'dsn-woo-powerall'); ?></th>
+                        <th><?php esc_html_e('Promotion dates', 'dsn-woo-powerall'); ?></th>
+                        <?php if ($table['reason']) : ?>
+                            <th><?php esc_html_e('Reason', 'dsn-woo-powerall'); ?></th>
+                        <?php endif; ?>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($table['items'] as $item) : ?>
+                        <tr>
+                            <td><a href="<?php echo esc_url(admin_url('post.php?post=' . (int) $item['edit_id'] . '&action=edit')); ?>"><?php echo esc_html($item['name']); ?></a></td>
+                            <td><?php echo esc_html($item['sku']); ?></td>
+                            <td><?php echo esc_html($format_price($item['regular'])); ?></td>
+                            <td><?php echo esc_html($format_price($item['current_sale'])); ?></td>
+                            <td><?php echo esc_html($format_price($item['new_sale'])); ?></td>
+                            <td><?php echo esc_html($format_date($item['start']) . ' → ' . $format_date($item['end'])); ?></td>
+                            <?php if ($table['reason']) : ?>
+                                <td><?php echo esc_html($item['reason']); ?></td>
+                            <?php endif; ?>
+                        </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+        <?php endforeach; ?>
         <?php
     }
 
