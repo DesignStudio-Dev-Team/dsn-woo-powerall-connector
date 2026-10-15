@@ -289,7 +289,7 @@ class Sync_Notifier {
     /**
      * @return string[]
      */
-    private function get_recipients() {
+    public function get_recipients() {
         $setting = (string) get_option(self::RECIPIENT_OPTION, self::DEFAULT_RECIPIENT);
         $recipients = array_filter(array_map('trim', explode(',', $setting)), 'is_email');
         if (empty($recipients)) {

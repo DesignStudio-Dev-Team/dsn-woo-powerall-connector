@@ -20,7 +20,7 @@ jobs:
           mkdir -p package/dsn-woo-powerall-connector
           # Copy repository contents into package/dsn-woo-powerall-connector but exclude CI, git and dev folders.
           # NOTE: languages/ is intentionally NOT excluded — translation .po/.mo files must ship in the zip.
-          rsync -av --exclude='.git' --exclude='.github' --exclude='node_modules' --exclude='.vscode' --exclude='package' --exclude='.DS_Store' ./ package/dsn-woo-powerall-connector/
+          rsync -av --exclude='.git' --exclude='.github' --exclude='node_modules' --exclude='.vscode' --exclude='package' --exclude='.DS_Store' --exclude='product_changes_log.txt' ./ package/dsn-woo-powerall-connector/
           # Zip the packaged plugin folder so the archive root contains the plugin folder only
           (cd package && zip -r ../release-package.zip dsn-woo-powerall-connector)
 

@@ -86,6 +86,10 @@ class Admin_Settings {
         register_setting('dsn_woo_powerall_settings', 'dsn_woo_powerall_token');
         register_setting('dsn_woo_powerall_settings', 'dsn_woo_powerall_sync_frequency');
         register_setting('dsn_woo_powerall_settings', 'dsn_woo_powerall_use_sale_price');
+        register_setting('dsn_woo_powerall_settings', Sync_Notifier::RECIPIENT_OPTION, array(
+            'sanitize_callback' => array($this, 'sanitize_alert_emails'),
+            'default' => Sync_Notifier::DEFAULT_RECIPIENT,
+        ));
         register_setting('dsn_woo_powerall_settings', 'dsn_woo_powerall_stock_tracking_mode', array(
             'sanitize_callback' => array($this, 'sanitize_stock_tracking_mode'),
             'default' => Stock_Helper::DEFAULT_MODE,
@@ -148,6 +152,14 @@ class Admin_Settings {
             'dsn_woo_powerall_use_sale_price',
             __('Use Powerall Sale Price', 'dsn-woo-powerall'),
             array($this, 'render_use_sale_price_field'),
+            'dsn-woo-powerall',
+            'dsn_woo_powerall_main_section'
+        );
+
+        add_settings_field(
+            Sync_Notifier::RECIPIENT_OPTION,
+            __('Alert Email', 'dsn-woo-powerall'),
+            array($this, 'render_alert_email_field'),
             'dsn-woo-powerall',
             'dsn_woo_powerall_main_section'
         );
@@ -1325,6 +1337,53 @@ class Admin_Settings {
             <?php esc_html_e('Enable to use the sale price from Powerall CRM.', 'dsn-woo-powerall'); ?>
         </p>
         <?php
+    }
+
+    /**
+     * Render alert email field.
+     *
+     * @return void
+     */
+    public function render_alert_email_field() {
+        $emails = get_option(Sync_Notifier::RECIPIENT_OPTION, Sync_Notifier::DEFAULT_RECIPIENT);
+        ?>
+        <input type="text"
+               class="regular-text"
+               id="<?php echo esc_attr(Sync_Notifier::RECIPIENT_OPTION); ?>"
+               name="<?php echo esc_attr(Sync_Notifier::RECIPIENT_OPTION); ?>"
+               value="<?php echo esc_attr($emails); ?>"
+               placeholder="<?php echo esc_attr(Sync_Notifier::DEFAULT_RECIPIENT); ?>">
+        <p class="description">
+            <?php
+            echo esc_html(sprintf(
+                /* translators: %s: default email address */
+                __('Receives an alert when a paid order does not reach Powerall, and the daily sync report when prices changed or the sync had errors. Separate several addresses with commas. Left empty, alerts go to %s.', 'dsn-woo-powerall'),
+                Sync_Notifier::DEFAULT_RECIPIENT
+            ));
+            ?>
+        </p>
+        <?php
+    }
+
+    /**
+     * Keep only valid addresses from a comma-separated list.
+     *
+     * @param mixed $value Submitted value
+     * @return string
+     */
+    public function sanitize_alert_emails($value) {
+        $entries = array_filter(array_map('trim', explode(',', (string) $value)));
+        $valid = array_filter(array_map('sanitize_email', $entries), 'is_email');
+
+        if (count($valid) < count($entries)) {
+            add_settings_error(
+                'dsn_woo_powerall_messages',
+                'invalid_alert_email',
+                __('Some alert email addresses were not valid and have been removed.', 'dsn-woo-powerall')
+            );
+        }
+
+        return implode(', ', $valid);
     }
 
     /**

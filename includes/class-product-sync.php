@@ -23,6 +23,13 @@ class Product_Sync {
     private $api_handler;
 
     /**
+     * Collects price changes and failures while a daily cron batch runs; null otherwise.
+     *
+     * @var Sync_Report|null
+     */
+    private $sync_report = null;
+
+    /**
      * Constructor
      *
      * @param API_Handler $api_handler
@@ -329,7 +336,12 @@ class Product_Sync {
             $total_products
         ));
 
-        $batch_summary = $this->process_product_batch($batch);
+        $this->sync_report = new Sync_Report();
+        try {
+            $batch_summary = $this->process_product_batch($batch);
+        } finally {
+            $this->sync_report = null;
+        }
 
         $state['processed'] += $batch_summary['processed'];
         $state['updated'] += $batch_summary['updated'];
@@ -473,6 +485,7 @@ class Product_Sync {
         $old_stock = $product->get_stock_quantity();
         $old_stock_status = $product->get_stock_status();
         $old_price = $product->get_sale_price();
+        $old_regular_price = (string) $product->get_regular_price();
         $new_price = $old_price;
         $price_changed = false;
         $manage_stock_changed = !$product->managing_stock();
@@ -507,7 +520,20 @@ class Product_Sync {
 
             $this->logger->info('SKU and WordPress IDs: ' . $sku . ': ' . $product_id);
             if ($console_id) {
-                $console_path = trailingslashit(WP_CONTENT_DIR) . 'plugins/syndified/website-content/json/Product/' . $console_id . '.json';
+                // Syndified stores product JSON under uploads; older installs that have not
+                // migrated yet still keep it inside the plugin folder.
+                $upload_dir    = wp_upload_dir();
+                $console_paths = array(
+                    trailingslashit($upload_dir['basedir']) . 'syndified/json/Product/' . $console_id . '.json',
+                    trailingslashit(WP_CONTENT_DIR) . 'plugins/syndified/website-content/json/Product/' . $console_id . '.json',
+                );
+                $console_path = $console_paths[0];
+                foreach ($console_paths as $candidate_path) {
+                    if (file_exists($candidate_path) && is_readable($candidate_path)) {
+                        $console_path = $candidate_path;
+                        break;
+                    }
+                }
                 if (file_exists($console_path) && is_readable($console_path)) {
                     $this->logger->info('Found console JSON for product SKU ' . $sku . ': ' . $console_path);
                     $json = file_get_contents($console_path);
@@ -566,6 +592,12 @@ class Product_Sync {
                 }
             } elseif ($has_console_promo) {
                 $this->logger->info('Console promo present; skipping sale price update for SKU ' . $sku);
+            }
+
+            // $price_changed is also true when a price is rewritten unchanged, so
+            // the report compares the actual regular and sale prices instead.
+            if ($price_changed && $this->sync_report) {
+                $this->sync_report->record_price_change($product, $sku, $old_regular_price, (string) $old_price);
             }
         }
 
@@ -1181,6 +1213,9 @@ class Product_Sync {
                     if (!empty($item_result['message'])) {
                         $summary['errors'][] = $item_result['message'];
                     }
+                    if ($this->sync_report) {
+                        $this->sync_report->record_product_failure($item_result);
+                    }
                     break;
                 case 'skipped':
                     $summary['skipped']++;
@@ -1385,6 +1420,13 @@ class Product_Sync {
         }
 
         $this->save_cron_sync_state($state);
+
+        try {
+            (new Missing_Products_Check())->run($this->get_powerall_codes_from_cache($state['run_id']));
+        } catch (\Throwable $e) {
+            $this->logger->error('Not-in-Powerall check failed: ' . $e->getMessage());
+        }
+
         $this->delete_manual_sync_cache($state['run_id']);
 
         $this->logger->info(sprintf(
@@ -1395,6 +1437,8 @@ class Product_Sync {
             $state['skipped'],
             $state['failed']
         ));
+
+        (new Sync_Report())->send();
 
         return $state;
     }
@@ -1487,6 +1531,39 @@ class Product_Sync {
         }
 
         return $batch;
+    }
+
+    /**
+     * Every ProductCode and EanCode in a run's cached Powerall product list.
+     *
+     * @param string $run_id
+     * @return array<string, bool> Codes as keys; empty when the cache is missing or unreadable
+     */
+    private function get_powerall_codes_from_cache($run_id) {
+        $cache_file = $this->get_manual_sync_cache_file($run_id);
+        if (empty($run_id) || !file_exists($cache_file) || !is_readable($cache_file)) {
+            return array();
+        }
+
+        $codes = array();
+        $file = new \SplFileObject($cache_file, 'r');
+        while (!$file->eof()) {
+            $decoded = json_decode(trim((string) $file->current()), true);
+            $file->next();
+
+            if (!is_array($decoded)) {
+                continue;
+            }
+
+            foreach (array('ProductCode', 'EanCode') as $field) {
+                $code = isset($decoded[$field]) ? trim((string) $decoded[$field]) : '';
+                if ($code !== '') {
+                    $codes[$code] = true;
+                }
+            }
+        }
+
+        return $codes;
     }
 
     /**

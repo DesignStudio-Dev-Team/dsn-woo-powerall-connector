@@ -97,4 +97,37 @@ if (defined('WP_CLI') && WP_CLI) {
 
         WP_CLI::success(sprintf('%d alert(s) %s.', $sent, $preview_dir !== '' ? 'written to ' . $preview_dir : 'sent to ' . implode(', ', $to)));
     });
+
+    /**
+     * Send (or preview) the pending daily sync report to a chosen address.
+     * The report is NOT cleared, so the real email still goes out after the next daily sync.
+     *
+     * wp dsnwoo sync-report --to=<emails>
+     * wp dsnwoo sync-report --preview=<file.html>
+     */
+    \WP_CLI::add_command('dsnwoo sync-report', function($args, $assoc_args) {
+        $to = isset($assoc_args['to']) ? array_filter(array_map('trim', explode(',', $assoc_args['to'])), 'is_email') : array();
+        $preview = isset($assoc_args['preview']) ? $assoc_args['preview'] : '';
+
+        if (empty($to) && $preview === '') {
+            WP_CLI::error('Pass --to=<emails> to send, or --preview=<file.html> to write the email as an HTML file.');
+        }
+
+        if ($preview !== '') {
+            add_filter('pre_wp_mail', function ($null, $atts) use ($preview) {
+                file_put_contents($preview, '<!-- Subject: ' . esc_html($atts['subject']) . " -->\n" . $atts['message']);
+                return true;
+            }, 10, 2);
+            $to = array('preview@localhost');
+        }
+
+        $result = (new \DSNWooPowerall\Sync_Report())->send_preview($to);
+        if ($result === null) {
+            WP_CLI::success('The report is empty: no price changes or errors since the last report, so no email would be sent.');
+        } elseif ($result) {
+            WP_CLI::success($preview !== '' ? 'Report written to ' . $preview : 'Report sent to ' . implode(', ', $to));
+        } else {
+            WP_CLI::error('The mail was not accepted.');
+        }
+    });
 }

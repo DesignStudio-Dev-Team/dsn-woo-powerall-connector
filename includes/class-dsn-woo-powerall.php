@@ -372,6 +372,9 @@ class DSN_Woo_Powerall {
             wp_doing_cron() ? 'yes' : 'no'
         ));
 
+        // Yesterday's report is still waiting if no run completed since.
+        (new Sync_Report())->send_if_stale();
+
         update_option(self::DAILY_SYNC_LAST_STATUS_OPTION, array(
             'status' => 'running',
             'started_at' => current_time('mysql'),
@@ -386,6 +389,7 @@ class DSN_Woo_Powerall {
             $result = $this->product_sync->start_cron_sync_run();
         } catch (\Throwable $e) {
             $this->logger->error('Daily product sync cron failed with an uncaught error: ' . $e->getMessage());
+            (new Sync_Report())->record_run_error('The daily sync crashed while starting: ' . $e->getMessage());
             update_option(self::DAILY_SYNC_LAST_STATUS_OPTION, array(
                 'status' => 'error',
                 'started_at' => wp_date('Y-m-d H:i:s', $started_at),
@@ -401,6 +405,7 @@ class DSN_Woo_Powerall {
 
         if (is_wp_error($result)) {
             $this->logger->error('Daily product sync cron could not start: ' . $result->get_error_message() . '. Automatic start retry remains scheduled.');
+            (new Sync_Report())->record_run_error('The daily sync could not start: ' . $result->get_error_message());
             $status = 'error';
             $message = $result->get_error_message() . ' Automatic retry queued for the next WP-Cron trigger.';
         } else {
@@ -474,6 +479,7 @@ class DSN_Woo_Powerall {
             } while ($status !== 'completed');
         } catch (\Throwable $e) {
             $this->logger->error('Daily product sync cron batch failed with an uncaught error: ' . $e->getMessage());
+            (new Sync_Report())->record_run_error('The daily sync crashed partway through: ' . $e->getMessage());
             update_option(self::DAILY_SYNC_LAST_STATUS_OPTION, array(
                 'status' => 'error',
                 'started_at' => wp_date('Y-m-d H:i:s', $started_at),
@@ -489,6 +495,7 @@ class DSN_Woo_Powerall {
 
         if (is_wp_error($result)) {
             $this->logger->error('Daily product sync cron batch stopped with error: ' . $result->get_error_message() . '. Resetting the failed run and scheduling a fresh start retry.');
+            (new Sync_Report())->record_run_error('The daily sync stopped partway through and was restarted: ' . $result->get_error_message());
             $this->product_sync->reset_cron_sync_run();
             wp_clear_scheduled_hook(self::DAILY_SYNC_BATCH_HOOK);
             $this->schedule_daily_sync_start_retry();
